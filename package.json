@@ -1,0 +1,29 @@
+{
+  "name": "e-beszamolo-scraper",
+  "version": "1.0.0",
+  "description": "E-beszámolo Financial Data Scraper",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "npx ts-node src/index.ts",
+    "build": "tsc",
+    "dev": "npx ts-node src/index.ts",
+    "single": "npx ts-node src/single.ts",
+    "bulk": "npx ts-node src/bulk.ts"
+  },
+  "keywords": [
+    "e-beszamolo",
+    "financial-data",
+    "web-scraping"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@playwright/test": "^1.57.0",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
