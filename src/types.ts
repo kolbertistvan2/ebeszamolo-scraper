@@ -22,6 +22,8 @@ export interface CompanyFinancialReport {
   taxNumber: string;
   headquarter: string;
   year: number;
+  previousYear: number;
+  targetYear: number;
   currency: string;
   unit: string;
   filingDate: string;

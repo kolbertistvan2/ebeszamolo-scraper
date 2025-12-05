@@ -332,24 +332,58 @@ export class EBeszamoloScraper {
         };
       });
 
-      // 7. Find and click on the first report (most recent year)
-      console.log('  → Looking for financial reports...');
+      // 7. Find and click on the report for the target year
+      console.log(`  → Looking for financial reports for year ${targetYear}...`);
 
-      // Try multiple selectors for report links
-      let reportLink = await page.$('a:has-text("Általános üzleti évet záró")');
-      if (!reportLink) {
-        reportLink = await page.$('a:has-text("ÜZLETI ÉVET ZÁRÓ")');
-      }
-      if (!reportLink) {
-        reportLink = await page.$('a:has-text("Éves beszámoló")');
+      // Keressük meg a megfelelő évre vonatkozó beszámolót
+      const reportSearchResult = await page.evaluate((year: number) => {
+        // Keressük a balance-container div-eket
+        const containers = document.querySelectorAll('div.balance-container');
+
+        // Gyűjtsük össze az elérhető éveket
+        const availableYears: number[] = [];
+
+        for (const container of Array.from(containers)) {
+          const containerText = container.textContent || '';
+
+          // Keressük az évszámot a december 31. előtt
+          const yearMatch = containerText.match(/(\d{4})\.\s*december\s*31/i);
+          if (yearMatch) {
+            availableYears.push(parseInt(yearMatch[1]));
+          }
+
+          // Keressük a tárgyév mintáját: "YYYY. december 31."
+          const yearPattern = new RegExp(`${year}\\.\\s*december\\s*31`, 'i');
+          if (yearPattern.test(containerText)) {
+            // Megtaláltuk - keressük meg benne a beszámoló linket
+            const link = container.querySelector('a.view-obr-balance-link');
+            if (link) {
+              return {
+                found: true,
+                selector: 'a.view-obr-balance-link[data-code="' + link.getAttribute('data-code') + '"]',
+                availableYears
+              };
+            }
+          }
+        }
+
+        // Nem találtuk meg a keresett évet
+        return {
+          found: false,
+          selector: null,
+          availableYears: [...new Set(availableYears)].sort((a, b) => b - a)
+        };
+      }, targetYear);
+
+      if (!reportSearchResult.found || !reportSearchResult.selector) {
+        const yearsText = reportSearchResult.availableYears.length > 0
+          ? `Elérhető évek: ${reportSearchResult.availableYears.join(', ')}`
+          : 'Nincs elérhető beszámoló';
+        console.log(`  ✗ No report found for year ${targetYear}. ${yearsText}`);
+        throw new Error(`A ${targetYear}. évre nincs elérhető beszámoló. ${yearsText}`);
       }
 
-      if (!reportLink) {
-        console.log('  ✗ No reports found');
-        return null;
-      }
-
-      await reportLink.click();
+      await page.click(reportSearchResult.selector);
       await page.waitForLoadState('networkidle');
       await this.delay(1000);
 
@@ -367,6 +401,8 @@ export class EBeszamoloScraper {
         taxNumber: companyInfo.taxNumber || financialData.taxNumber,
         headquarter: companyInfo.headquarter || financialData.headquarter,
         year: targetYear,
+        previousYear: financialData.extractedPreviousYear || targetYear - 1,
+        targetYear: financialData.extractedTargetYear || targetYear,
         currency: financialData.currency,
         unit: financialData.unit,
         filingDate: financialData.filingDate,
@@ -458,6 +494,17 @@ export class EBeszamoloScraper {
 
       const hqMatch = pageText.match(/Székhely:\s*([^\n]+)/);
       const headquarter = hqMatch ? hqMatch[1].trim() : '';
+
+      // Évszámok kinyerése a beszámoló időszakból
+      // Keressük a mintát: "YYYY. január 01. - YYYY. december 31." vagy hasonló
+      let extractedPreviousYear = 0;
+      let extractedTargetYear = 0;
+
+      const periodMatch = pageText.match(/(\d{4})\.\s*január\s*\d{1,2}\.\s*-\s*(\d{4})\.\s*december\s*\d{1,2}\./i);
+      if (periodMatch) {
+        extractedPreviousYear = parseInt(periodMatch[1]) - 1; // Előző év = tárgyév - 1
+        extractedTargetYear = parseInt(periodMatch[2]);
+      }
 
       // Extract Income Statement and Balance Sheet
       const incomeStatementRows: RowData[] = [];
@@ -581,6 +628,8 @@ export class EBeszamoloScraper {
         registrationNumber,
         taxNumber,
         headquarter,
+        extractedPreviousYear,
+        extractedTargetYear,
         incomeStatement: { rows: incomeStatementRows },
         balanceSheet: { rows: balanceSheetRows }
       };
@@ -605,17 +654,23 @@ export class EBeszamoloScraper {
 
   // Export Income Statements to CSV
   exportIncomeStatementToCSV(reports: CompanyFinancialReport[], outputPath: string): void {
+    // Build headers dynamically based on first report's years
+    const firstReport = reports[0];
+    const prevYearLabel = firstReport?.previousYear || 'Previous Year';
+    const targetYearLabel = firstReport?.targetYear || 'Target Year';
+
     const headers = [
-      'Company Name',
-      'Registration Number',
-      'Year',
-      'Row Number',
-      'Item Name',
-      'Previous Year',
-      'Amendments',
-      'Target Year'
+      'Cégnév',
+      'Cégjegyzékszám',
+      'Beszámoló éve',
+      'Sorszám',
+      'Megnevezés',
+      prevYearLabel.toString(),
+      'Módosítások',
+      targetYearLabel.toString()
     ];
 
+    // UTF-8 BOM for Excel compatibility
     const rows: string[] = [headers.join(',')];
 
     for (const report of reports) {
@@ -633,23 +688,30 @@ export class EBeszamoloScraper {
       }
     }
 
-    fs.writeFileSync(outputPath, rows.join('\n'), 'utf-8');
+    const csvContent = '\uFEFF' + rows.join('\n');
+    fs.writeFileSync(outputPath, csvContent, 'utf-8');
     console.log(`✓ Income Statement CSV exported to: ${outputPath}`);
   }
 
   // Export Balance Sheets to CSV
   exportBalanceSheetToCSV(reports: CompanyFinancialReport[], outputPath: string): void {
+    // Build headers dynamically based on first report's years
+    const firstReport = reports[0];
+    const prevYearLabel = firstReport?.previousYear || 'Previous Year';
+    const targetYearLabel = firstReport?.targetYear || 'Target Year';
+
     const headers = [
-      'Company Name',
-      'Registration Number',
-      'Year',
-      'Row Number',
-      'Item Name',
-      'Previous Year',
-      'Amendments',
-      'Target Year'
+      'Cégnév',
+      'Cégjegyzékszám',
+      'Beszámoló éve',
+      'Sorszám',
+      'Megnevezés',
+      prevYearLabel.toString(),
+      'Módosítások',
+      targetYearLabel.toString()
     ];
 
+    // UTF-8 BOM for Excel compatibility
     const rows: string[] = [headers.join(',')];
 
     for (const report of reports) {
@@ -667,27 +729,31 @@ export class EBeszamoloScraper {
       }
     }
 
-    fs.writeFileSync(outputPath, rows.join('\n'), 'utf-8');
+    const csvContent = '\uFEFF' + rows.join('\n');
+    fs.writeFileSync(outputPath, csvContent, 'utf-8');
     console.log(`✓ Balance Sheet CSV exported to: ${outputPath}`);
   }
 
   // Export summary to CSV
   exportSummaryToCSV(reports: CompanyFinancialReport[], outputPath: string): void {
     const headers = [
-      'Company Name',
-      'Registration Number',
-      'Tax Number',
-      'Headquarter',
-      'Year',
-      'Currency',
-      'Unit',
-      'Filing Date',
-      'Income Statement Rows',
-      'Balance Sheet Rows',
-      'Extracted At',
-      'Source URL'
+      'Cégnév',
+      'Cégjegyzékszám',
+      'Adószám',
+      'Székhely',
+      'Beszámoló éve',
+      'Előző év',
+      'Tárgyév',
+      'Pénznem',
+      'Egység',
+      'Benyújtás dátuma',
+      'Eredménykimutatás sorok',
+      'Mérleg sorok',
+      'Lekérdezve',
+      'Forrás URL'
     ];
 
+    // UTF-8 BOM for Excel compatibility
     const rows: string[] = [headers.join(',')];
 
     for (const report of reports) {
@@ -697,6 +763,8 @@ export class EBeszamoloScraper {
         `"${report.taxNumber}"`,
         `"${report.headquarter}"`,
         report.year,
+        report.previousYear,
+        report.targetYear,
         `"${report.currency}"`,
         `"${report.unit}"`,
         `"${report.filingDate}"`,
@@ -707,7 +775,8 @@ export class EBeszamoloScraper {
       ].join(','));
     }
 
-    fs.writeFileSync(outputPath, rows.join('\n'), 'utf-8');
+    const csvContent = '\uFEFF' + rows.join('\n');
+    fs.writeFileSync(outputPath, csvContent, 'utf-8');
     console.log(`✓ Summary CSV exported to: ${outputPath}`);
   }
 }
