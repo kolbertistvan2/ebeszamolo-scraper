@@ -1,0 +1,1 @@
+npm run multi-year -- <fajlnev>.csv --workers 10 --years 2024

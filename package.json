@@ -8,7 +8,8 @@
     "build": "tsc",
     "dev": "npx ts-node src/index.ts",
     "single": "npx ts-node src/single.ts",
-    "bulk": "npx ts-node src/bulk.ts"
+    "bulk": "npx ts-node src/bulk.ts",
+    "multi-year": "npx ts-node src/multi-year.ts"
   },
   "keywords": [
     "e-beszamolo",
@@ -18,8 +19,11 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@browserbasehq/sdk": "^2.6.0",
     "@playwright/test": "^1.57.0",
-    "dotenv": "^17.2.3"
+    "dotenv": "^17.2.3",
+    "exceljs": "^4.4.0",
+    "playwright-core": "^1.57.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

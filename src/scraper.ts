@@ -1,53 +1,106 @@
-import { chromium, Browser, Page } from '@playwright/test';
+import { chromium, Browser, Page, BrowserContext } from 'playwright-core';
+import Browserbase from '@browserbasehq/sdk';
 import * as fs from 'fs';
 import { CompanyFinancialReport } from './types';
 import { normalizeCompanyName } from './utils';
 
-interface ProxyConfig {
-  server: string;
-  username?: string;
-  password?: string;
+interface InitOptions {
+  useBrowserbase?: boolean;  // Default: true if BROWSERBASE_API_KEY is set
+  headless?: boolean;
 }
 
 export class EBeszamoloScraper {
   private browser: Browser | null = null;
+  private context: BrowserContext | null = null;
+  private bb: Browserbase | null = null;
+  private sessionId: string | null = null;
   private readonly baseURL = 'https://e-beszamolo.im.gov.hu';
-  private termsAccepted = false;
-  private proxyConfig: ProxyConfig | null = null;
+  private useBrowserbase = false;
 
-  async initialize(options?: { proxy?: ProxyConfig }) {
-    // Check for proxy from options or environment variables
-    if (options?.proxy) {
-      this.proxyConfig = options.proxy;
-    } else if (process.env.PROXY_SERVER) {
-      this.proxyConfig = {
-        server: process.env.PROXY_SERVER,
-        username: process.env.PROXY_USERNAME,
-        password: process.env.PROXY_PASSWORD
-      };
+  async initialize(options?: InitOptions) {
+    // Determine if we should use Browserbase
+    const hasBrowserbaseConfig = !!(process.env.BROWSERBASE_API_KEY && process.env.BROWSERBASE_PROJECT_ID);
+    this.useBrowserbase = options?.useBrowserbase ?? hasBrowserbaseConfig;
+
+    if (this.useBrowserbase && hasBrowserbaseConfig) {
+      // Use Browserbase
+      this.bb = new Browserbase({
+        apiKey: process.env.BROWSERBASE_API_KEY!,
+      });
+
+      // Proxy options:
+      // - false: no proxy (direct connection from Browserbase datacenter)
+      // - true: US residential proxy
+      // - [{ type: 'browserbase', geolocation: { country: 'HU' } }]: Hungarian residential proxy
+      // Default: Hungarian proxy ON (e-beszamolo works better with Hungarian IP)
+      // Set BROWSERBASE_PROXY=false to disable
+      const useProxy = process.env.BROWSERBASE_PROXY !== 'false';
+      const proxyConfig = useProxy
+        ? [{ type: 'browserbase' as const, geolocation: { country: 'HU' } }]
+        : false;
+
+      const session = await this.bb.sessions.create({
+        projectId: process.env.BROWSERBASE_PROJECT_ID!,
+        region: 'eu-central-1',  // Frankfurt - closest to Hungary
+        proxies: proxyConfig,
+        browserSettings: {
+          fingerprint: {
+            browsers: ['chrome'],
+            devices: ['desktop'],
+            operatingSystems: ['windows'],
+            locales: ['hu-HU', 'hu'],  // Hungarian locale
+          },
+          viewport: {
+            width: 1280,
+            height: 720,
+          },
+        },
+      });
+
+      this.sessionId = session.id;
+      console.log(`✓ Browserbase session created: ${session.id}`);
+
+      // Get live view URL
+      const debugInfo = await this.bb.sessions.debug(session.id);
+      console.log(`✓ Live view: ${debugInfo.debuggerFullscreenUrl}`);
+
+      this.browser = await chromium.connectOverCDP(session.connectUrl);
+      this.context = this.browser.contexts()[0];
+      console.log('✓ Browser connected via Browserbase');
+    } else {
+      // Use local Chrome
+      console.log('⚠ Browserbase not configured, using local Chrome');
+      this.browser = await chromium.launch({
+        headless: options?.headless ?? false,
+        args: ['--disable-blink-features=AutomationControlled']
+      });
+      this.context = await this.browser.newContext();
+      console.log('✓ Local browser launched');
     }
-
-    const launchOptions: Parameters<typeof chromium.launch>[0] = {
-      headless: false,
-      args: ['--disable-blink-features=AutomationControlled']
-    };
-
-    if (this.proxyConfig) {
-      launchOptions.proxy = {
-        server: this.proxyConfig.server,
-        username: this.proxyConfig.username,
-        password: this.proxyConfig.password
-      };
-      console.log(`✓ Using proxy: ${this.proxyConfig.server}`);
-    }
-
-    this.browser = await chromium.launch(launchOptions);
-    console.log('✓ Browser launched');
   }
 
   async close() {
     await this.browser?.close();
     console.log('✓ Browser closed');
+  }
+
+  // Reinitialize the browser session (for session timeout recovery)
+  async reinitialize() {
+    console.log('  → Reinitializing browser session...');
+    try {
+      await this.browser?.close();
+    } catch {
+      // Ignore close errors
+    }
+    await this.initialize({ useBrowserbase: this.useBrowserbase });
+  }
+
+  // Check if error indicates session has expired
+  private isSessionExpiredError(error: unknown): boolean {
+    const msg = error instanceof Error ? error.message : String(error);
+    return msg.includes('Target page, context or browser has been closed') ||
+           msg.includes('Session closed') ||
+           msg.includes('browser has been closed');
   }
 
   async scrapeCompanies(
@@ -71,7 +124,7 @@ export class EBeszamoloScraper {
         console.error(`✗ Error: ${error instanceof Error ? error.message : error}`);
       }
 
-      await this.delay(2000);
+      await this.randomDelay(1500, 3500);
     }
 
     return results;
@@ -138,7 +191,7 @@ export class EBeszamoloScraper {
         console.error(`✗ Error: ${error instanceof Error ? error.message : error}`);
       }
 
-      await this.delay(2000);
+      await this.randomDelay(1500, 3500);
     }
 
     return results;
@@ -149,7 +202,32 @@ export class EBeszamoloScraper {
     targetYear: number,
     originalName?: string
   ): Promise<CompanyFinancialReport | null> {
-    const page = await this.browser!.newPage();
+    // ALWAYS create a new page for each scrape to avoid state issues
+    // Close any existing pages first in Browserbase mode
+    if (this.useBrowserbase) {
+      const existingPages = this.context!.pages();
+      for (const p of existingPages) {
+        try {
+          await p.close();
+        } catch {
+          // Ignore close errors
+        }
+      }
+    }
+
+    let page;
+    try {
+      page = await this.context!.newPage();
+    } catch (error) {
+      // Session expired - reinitialize and retry
+      if (this.isSessionExpiredError(error)) {
+        console.log('  ! Session expired, reinitializing...');
+        await this.reinitialize();
+        page = await this.context!.newPage();
+      } else {
+        throw error;
+      }
+    }
 
     try {
       // 1. Navigate to search page
@@ -157,6 +235,30 @@ export class EBeszamoloScraper {
       await page.goto(`${this.baseURL}/oldal/beszamolo_kereses`, {
         waitUntil: 'networkidle'
       });
+
+      // Check for IP block or access denied
+      const pageText = await page.innerText('body').catch(() => '');
+      const lowerText = pageText.toLowerCase();
+
+      // Check for specific rate limit message from e-beszamolo
+      // IMPORTANT: Only detect the ACTUAL rate limit message, not the general proxy warning on the page
+      // The actual rate limit message is: "Túl sok kérés érkezett rövid időn belül az IP címről"
+      // The normal page has a warning: "A rendszer a valós IP címet elrejtő Anonymous Proxy hálózatokból nem használható"
+      // We must NOT trigger on the normal warning!
+      const isRateLimited = lowerText.includes('túl sok kérés érkezett rövid időn belül');
+
+      if (isRateLimited) {
+        console.error('  ⛔ RATE LIMITED!');
+        // Wait random time (45-75s) and reinitialize with new session/IP
+        const waitTime = Math.floor(Math.random() * 30000) + 45000;
+        console.log(`  → Waiting ${Math.round(waitTime/1000)}s before retry with new session...`);
+        await this.delay(waitTime);
+        await this.reinitialize();
+        throw new Error('RATE_LIMITED: Too many requests, session reinitialized');
+      }
+
+      // Wait for search form to be ready
+      await page.waitForSelector('input#firmTaxNumber', { timeout: 15000 });
 
       // 2. Helper to fill and submit search form
       const fillAndSubmit = async () => {
@@ -182,22 +284,47 @@ export class EBeszamoloScraper {
         await this.delay(2000); // Wait for results to load after re-submit
       }
 
+      // Check for rate limit AFTER search submission (can appear after clicking search)
+      await this.delay(1000); // Wait for any rate limit message to appear
+      const postSearchText = await page.innerText('body').catch(() => '');
+      if (postSearchText.toLowerCase().includes('túl sok kérés érkezett rövid időn belül')) {
+        console.error('  ⛔ RATE LIMITED after search!');
+        const waitTime = Math.floor(Math.random() * 30000) + 45000;
+        console.log(`  → Waiting ${Math.round(waitTime/1000)}s before retry with new session...`);
+        await this.delay(waitTime);
+        await this.reinitialize();
+        throw new Error('RATE_LIMITED: Too many requests, session reinitialized');
+      }
+
       // 4. Wait for results table - look for link in any table row that's not the search form
-      await page.waitForSelector('table tbody tr td a[href="#"]', { timeout: 15000 });
+      // Use longer timeout and retry logic for slow connections (e.g., proxy)
+      let resultFound = false;
+      for (let attempt = 0; attempt < 3 && !resultFound; attempt++) {
+        try {
+          await page.waitForSelector('table tbody tr td a[href="#"]', { timeout: 20000 });
+          resultFound = true;
+        } catch {
+          if (attempt < 2) {
+            console.log(`  → Retry ${attempt + 1}/2: waiting for search results...`);
+            await this.delay(2000);
+          } else {
+            throw new Error('Search results not found after 3 attempts');
+          }
+        }
+      }
       await this.delay(1000);
 
-      // 5. Find best matching result
-      // For both tax number and name search, prefer rows with fewer historical names
-      const bestMatch = await page.evaluate((args: { searchTerm: string; isTaxSearch: boolean }) => {
+      // 5. Get all result indices and sort them
+      const resultIndices = await page.evaluate((args: { searchTerm: string; isTaxSearch: boolean }) => {
           const { searchTerm, isTaxSearch } = args;
           // Find the results table by looking for a table with "Cégnév" header
           const tables = Array.from(document.querySelectorAll('table'));
           const resultsTable = tables.find(t => t.querySelector('th')?.textContent?.includes('Cégnév'));
-          if (!resultsTable) return { found: false, index: 0, debug: [] };
+          if (!resultsTable) return [];
           const rows = Array.from(resultsTable.querySelectorAll('tbody tr'));
 
           // Collect all rows with their name count
-          const allRows: { index: number; nameCount: number; exact: boolean }[] = [];
+          const allRows: { index: number; nameCount: number }[] = [];
 
           for (let i = 0; i < rows.length; i++) {
             const row = rows[i];
@@ -210,214 +337,271 @@ export class EBeszamoloScraper {
             // Count names by counting <br> tags + 1 (names are separated by <br>)
             const brCount = link.querySelectorAll('br').length;
             const nameCount = brCount + 1;
-            allRows.push({ index: i, nameCount, exact: false });
+            allRows.push({ index: i, nameCount });
           }
 
-          // For tax number search: prefer row with fewest names (likely the current/active company)
+          // For tax number search: try all results, starting with the most names
+          // (more name changes = more likely to be the currently active company)
           if (isTaxSearch) {
-            if (allRows.length === 0) return { found: false, index: 0, debug: [] };
-            // Sort by nameCount ascending (fewer names = better)
-            allRows.sort((a, b) => a.nameCount - b.nameCount);
-            return { found: true, index: allRows[0].index, debug: allRows };
+            allRows.sort((a, b) => b.nameCount - a.nameCount);
+            return allRows.map(r => r.index);
           }
 
-          // For name search: match by company name
-          const searchUpper = searchTerm.toUpperCase();
+          // For name search: return indices as-is (will be handled below)
+          return allRows.map(r => r.index);
+        }, { searchTerm: search.value, isTaxSearch: search.type === 'taxNumber' });
 
-          // Common company suffixes to strip for comparison
-          const suffixes = ['KFT', 'KFT.', 'ZRT', 'ZRT.', 'NYRT', 'NYRT.', 'BT', 'BT.',
-                          'KKT', 'KKT.', 'RT', 'RT.', 'KORLÁTOLT FELELŐSSÉGŰ TÁRSASÁG',
-                          'ZÁRTKÖRŰEN MŰKÖDŐ RÉSZVÉNYTÁRSASÁG', 'BETÉTI TÁRSASÁG'];
+      if (resultIndices.length === 0) {
+        console.log('  ✗ No search results found');
+        return null;
+      }
 
-          const stripSuffix = (name: string): string => {
-            let result = name.toUpperCase().trim();
-            for (const suffix of suffixes) {
-              if (result.endsWith(suffix)) {
-                result = result.slice(0, -suffix.length).trim();
-              }
-            }
-            return result;
+      console.log(`  [Debug] Found ${resultIndices.length} result(s), trying in order: ${resultIndices.join(', ')}`);
+
+      // 6. Try each result until we find one with the target year
+      let lastError: string | null = null;
+      let lastCompanyInfo: { companyName: string; registrationNumber: string; taxNumber: string; headquarter: string } | null = null;
+
+      for (const resultIndex of resultIndices) {
+        // Get fresh result links (page might have been reset)
+        const resultLinks = await page.$$('table:has(th:text("Cégnév")) tbody tr td:first-child a');
+        if (resultLinks.length === 0) {
+          console.log('  ✗ No search results found');
+          return null;
+        }
+
+        const resultLink = resultLinks[resultIndex];
+        if (!resultLink) continue;
+
+        console.log(`  → Trying result #${resultIndex + 1}...`);
+        await resultLink.click();
+        await page.waitForLoadState('networkidle');
+
+        // Wait for balance containers to load (they are loaded via JS)
+        try {
+          await page.waitForSelector('div.balance-container', { timeout: 10000 });
+        } catch {
+          // If no balance-container, try waiting for any report link
+          try {
+            await page.waitForSelector('a[href="#"]:has-text("záró")', { timeout: 5000 });
+          } catch {
+            // Continue anyway
+          }
+        }
+        await this.delay(500); // Extra delay for JS rendering
+
+        // Extract company info from the list page
+        console.log('  → Extracting company information...');
+        const companyInfo = await page.evaluate(() => {
+          const text = document.body.innerText;
+          // Extract company name from "Cég neve:" field
+          const nameMatch = text.match(/Cég neve:\s*([^\n\t]+)/);
+          // Try both formats: "Cégjegyzékszáma:" and "Nyilvántartási szám:"
+          const regMatch = text.match(/(?:Cégjegyzékszáma|Nyilvántartási szám):\s*(\d{2}-\d{2}-\d{6})/);
+          const taxMatch = text.match(/Adószám:\s*([\d-]+)/);
+          const hqMatch = text.match(/Székhely:\s*([^\n]+)/);
+
+          return {
+            companyName: nameMatch ? nameMatch[1].trim() : '',
+            registrationNumber: regMatch ? regMatch[1] : '',
+            taxNumber: taxMatch ? taxMatch[1] : '',
+            headquarter: hqMatch ? hqMatch[1].trim() : ''
           };
+        });
 
-          const searchStripped = stripSuffix(searchUpper);
-          const matches: { index: number; nameCount: number; exact: boolean }[] = [];
+        lastCompanyInfo = companyInfo;
 
-          for (let i = 0; i < rows.length; i++) {
-            const row = rows[i];
-            const firstCell = row.querySelector('td:first-child');
-            if (!firstCell) continue;
+        // Find and click on the report for the target year
+        console.log(`  → Looking for financial reports for year ${targetYear}...`);
 
-            const link = firstCell.querySelector('a');
-            if (!link) continue;
+        // Keressük meg a megfelelő évre vonatkozó beszámolót
+        const reportSearchResult = await page.evaluate((year: number) => {
+          const availableYears: number[] = [];
 
-            const cellText = firstCell.textContent || '';
-            const names = cellText.split('\n').map((l: string) => l.trim()).filter((l: string) => l);
+          // Először próbáljuk a régi struktúrát (balance-container)
+          const containers = document.querySelectorAll('div.balance-container');
 
-            // Check each name in this row - first look for exact matches
-            let foundExact = false;
-            for (const name of names) {
-              const nameStripped = stripSuffix(name);
-              if (nameStripped === searchStripped) {
-                matches.push({ index: i, nameCount: names.length, exact: true });
-                foundExact = true;
-                break;
+          for (const container of Array.from(containers)) {
+            const containerText = container.textContent || '';
+            const yearMatch = containerText.match(/(\d{4})\.\s*december\s*31/i);
+            if (yearMatch) {
+              availableYears.push(parseInt(yearMatch[1]));
+            }
+
+            const yearPattern = new RegExp(`${year}\\.\\s*december\\s*31`, 'i');
+            if (yearPattern.test(containerText)) {
+              const link = container.querySelector('a.view-obr-balance-link');
+              if (link) {
+                return {
+                  found: true,
+                  selector: 'a.view-obr-balance-link[data-code="' + link.getAttribute('data-code') + '"]',
+                  availableYears
+                };
               }
             }
-            // If no exact match, check for startsWith
-            if (!foundExact) {
-              for (const name of names) {
-                const nameStripped = stripSuffix(name);
-                if (nameStripped.startsWith(searchStripped)) {
-                  matches.push({ index: i, nameCount: names.length, exact: false });
-                  break;
+          }
+
+          // Ha nem találtunk balance-container-t, próbáljuk az új struktúrát
+          // Az új struktúrában a beszámolók generic div-ekben vannak,
+          // a link szövege "Általános üzleti évet záró" vagy "ÜZLETI ÉVET ZÁRÓ"
+          const allLinks = document.querySelectorAll('a[href="#"]');
+          let foundLink: Element | null = null;
+          let foundIndex = -1;
+
+          for (let i = 0; i < allLinks.length; i++) {
+            const link = allLinks[i];
+            const linkText = link.textContent?.trim() || '';
+
+            // Keressük a beszámoló linkeket
+            // Robusztus keresés: elfogadjuk a link szöveget ha tartalmaz "évet záró" vagy "ÉVET ZÁRÓ" szöveget
+            // (case insensitive és Unicode-barát)
+            const isReportLink = /[üu]zleti\s+[ée]vet\s+z[aá]r[oó]/i.test(linkText) ||
+                                 linkText.toUpperCase().includes('ÉVET ZÁRÓ') ||
+                                 linkText.toLowerCase().includes('évet záró');
+            if (isReportLink) {
+              // Nézzük meg a környező szöveget, hogy tartalmazza-e a keresett évet
+              const parent = link.parentElement;
+              if (!parent) continue;
+
+              const parentText = parent.textContent || '';
+
+              // Keressük az évszámot: "YYYY. január 01. - YYYY. december 31."
+              // Unicode-barát regex az ékezetes karakterekhez
+              const yearRangeMatch = parentText.match(/(\d{4})\.\s*janu[aá]r\s*\d+\.\s*-\s*(\d{4})\.\s*december\s*31/i);
+              if (yearRangeMatch) {
+                const reportYear = parseInt(yearRangeMatch[2]);
+                availableYears.push(reportYear);
+
+                if (reportYear === year) {
+                  foundLink = link;
+                  foundIndex = i;
                 }
               }
             }
           }
 
-          if (matches.length > 0) {
-            // Sort: prefer exact matches first, then by fewer names
-            matches.sort((a, b) => {
-              if (a.exact !== b.exact) return a.exact ? -1 : 1;
-              return a.nameCount - b.nameCount;  // Prefer fewer historical names
-            });
-            return { found: true, index: matches[0].index, debug: matches };
+          if (foundLink && foundIndex >= 0) {
+            // Adjunk egyedi azonosítót a linknek ha nincs
+            const uniqueId = `report-link-${foundIndex}`;
+            foundLink.setAttribute('data-report-id', uniqueId);
+            return {
+              found: true,
+              selector: `a[data-report-id="${uniqueId}"]`,
+              availableYears: [...new Set(availableYears)].sort((a, b) => b - a)
+            };
           }
 
-          // Fallback: return last row (usually most recent)
-          return { found: false, index: rows.length - 1, debug: [] };
-        }, { searchTerm: search.value, isTaxSearch: search.type === 'taxNumber' });
+          // Nem találtuk meg a keresett évet
+          return {
+            found: false,
+            selector: null,
+            availableYears: [...new Set(availableYears)].sort((a, b) => b - a)
+          };
+        }, targetYear);
 
-      // Debug output
-      if ('debug' in bestMatch && Array.isArray(bestMatch.debug)) {
-        console.log(`  [Debug] Matches found: ${JSON.stringify(bestMatch.debug)}`);
-      }
+        if (!reportSearchResult.found || !reportSearchResult.selector) {
+          const yearsText = reportSearchResult.availableYears.length > 0
+            ? `Elérhető évek: ${reportSearchResult.availableYears.join(', ')}`
+            : 'Nincs elérhető beszámoló';
+          console.log(`  ✗ Result #${resultIndex + 1}: No report for year ${targetYear}. ${yearsText}`);
+          lastError = `A ${targetYear}. évre nincs elérhető beszámoló. ${yearsText}`;
 
-      // Get the result link directly using the index from bestMatch
-      const resultLinks = await page.$$('table:has(th:text("Cégnév")) tbody tr td:first-child a');
-      if (resultLinks.length === 0) {
-        console.log('  ✗ No search results found');
-        return null;
-      }
+          // Go back to results page to try next result
+          const currentResultIdx = resultIndices.indexOf(resultIndex);
+          if (currentResultIdx < resultIndices.length - 1) {
+            console.log(`  → Going back to try next result (${currentResultIdx + 2}/${resultIndices.length})...`);
+            await page.goBack();
+            await page.waitForLoadState('networkidle');
+            await this.delay(1000); // Increased delay
 
-      const resultLink = resultLinks[bestMatch.index];
-
-      if (!resultLink) {
-        console.log('  ✗ No search results found');
-        return null;
-      }
-
-      if (!bestMatch.found) {
-        console.log('  ⚠ No exact match found, using last result (most recent)');
-      }
-
-      await resultLink.click();
-      await page.waitForLoadState('networkidle');
-
-      // 6. Extract company info from the list page
-      console.log('  → Extracting company information...');
-      const companyInfo = await page.evaluate(() => {
-        const text = document.body.innerText;
-        // Extract company name from "Cég neve:" field
-        const nameMatch = text.match(/Cég neve:\s*([^\n\t]+)/);
-        // Try both formats: "Cégjegyzékszáma:" and "Nyilvántartási szám:"
-        const regMatch = text.match(/(?:Cégjegyzékszáma|Nyilvántartási szám):\s*(\d{2}-\d{2}-\d{6})/);
-        const taxMatch = text.match(/Adószám:\s*([\d-]+)/);
-        const hqMatch = text.match(/Székhely:\s*([^\n]+)/);
-
-        return {
-          companyName: nameMatch ? nameMatch[1].trim() : '',
-          registrationNumber: regMatch ? regMatch[1] : '',
-          taxNumber: taxMatch ? taxMatch[1] : '',
-          headquarter: hqMatch ? hqMatch[1].trim() : ''
-        };
-      });
-
-      // 7. Find and click on the report for the target year
-      console.log(`  → Looking for financial reports for year ${targetYear}...`);
-
-      // Keressük meg a megfelelő évre vonatkozó beszámolót
-      const reportSearchResult = await page.evaluate((year: number) => {
-        // Keressük a balance-container div-eket
-        const containers = document.querySelectorAll('div.balance-container');
-
-        // Gyűjtsük össze az elérhető éveket
-        const availableYears: number[] = [];
-
-        for (const container of Array.from(containers)) {
-          const containerText = container.textContent || '';
-
-          // Keressük az évszámot a december 31. előtt
-          const yearMatch = containerText.match(/(\d{4})\.\s*december\s*31/i);
-          if (yearMatch) {
-            availableYears.push(parseInt(yearMatch[1]));
-          }
-
-          // Keressük a tárgyév mintáját: "YYYY. december 31."
-          const yearPattern = new RegExp(`${year}\\.\\s*december\\s*31`, 'i');
-          if (yearPattern.test(containerText)) {
-            // Megtaláltuk - keressük meg benne a beszámoló linket
-            const link = container.querySelector('a.view-obr-balance-link');
-            if (link) {
-              return {
-                found: true,
-                selector: 'a.view-obr-balance-link[data-code="' + link.getAttribute('data-code') + '"]',
-                availableYears
-              };
+            // Verify we're back on the results page
+            const backOnResults = await page.$('table:has(th:text("Cégnév"))');
+            if (!backOnResults) {
+              console.log('  ! Not on results page, navigating back to search...');
+              await page.goto(`${this.baseURL}/oldal/beszamolo_kereses`, { waitUntil: 'networkidle' });
+              await page.waitForSelector('input#firmTaxNumber', { timeout: 15000 });
+              await page.fill('input#firmTaxNumber', search.value);
+              await this.solveCaptchaIfPresent(page);
+              await page.click('button#btnSubmit');
+              await page.waitForSelector('table tbody tr td a[href="#"]', { timeout: 20000 });
+              await this.delay(1000);
             }
+            continue; // Try next result
           }
+          continue; // No more results to try
         }
 
-        // Nem találtuk meg a keresett évet
+        // Found the year! Extract the data
+        await page.click(reportSearchResult.selector);
+        await page.waitForLoadState('networkidle');
+
+        // Wait for the financial tables to load - these are critical for data extraction
+        console.log('  → Waiting for financial tables to load...');
+        try {
+          // Wait for either EREDMÉNYKIMUTATÁS or MÉRLEGE table to appear
+          await page.waitForFunction(
+            () => {
+              const tables = Array.from(document.querySelectorAll('table'));
+              for (const table of tables) {
+                const text = (table as HTMLTableElement).innerText.toUpperCase();
+                if (text.includes('EREDMÉNYKIMUTATÁS') || text.includes('MÉRLEGE')) {
+                  // Also check that the table has actual data rows
+                  const rows = table.querySelectorAll('tbody tr td');
+                  if (rows.length > 10) return true;
+                }
+              }
+              return false;
+            },
+            { timeout: 15000 }
+          );
+        } catch {
+          console.log('  ! Warning: Financial tables not found after waiting');
+        }
+        await this.delay(500);
+
+        // Extract financial data from the report page
+        console.log('  → Extracting financial data tables...');
+        const financialData = await this.extractFinancialData(page);
+
+        if (!financialData) {
+          continue; // Try next result
+        }
+
+        // Success! Return the data
         return {
-          found: false,
-          selector: null,
-          availableYears: [...new Set(availableYears)].sort((a, b) => b - a)
+          companyName: originalName || companyInfo.companyName || financialData.companyName || search.value,
+          registrationNumber: companyInfo.registrationNumber || financialData.registrationNumber,
+          taxNumber: companyInfo.taxNumber || financialData.taxNumber,
+          headquarter: companyInfo.headquarter || financialData.headquarter,
+          year: targetYear,
+          previousYear: financialData.extractedPreviousYear || targetYear - 1,
+          targetYear: financialData.extractedTargetYear || targetYear,
+          currency: financialData.currency,
+          unit: financialData.unit,
+          filingDate: financialData.filingDate,
+          incomeStatement: financialData.incomeStatement,
+          balanceSheet: financialData.balanceSheet,
+          extractedAt: new Date().toISOString(),
+          sourceURL: page.url()
         };
-      }, targetYear);
-
-      if (!reportSearchResult.found || !reportSearchResult.selector) {
-        const yearsText = reportSearchResult.availableYears.length > 0
-          ? `Elérhető évek: ${reportSearchResult.availableYears.join(', ')}`
-          : 'Nincs elérhető beszámoló';
-        console.log(`  ✗ No report found for year ${targetYear}. ${yearsText}`);
-        throw new Error(`A ${targetYear}. évre nincs elérhető beszámoló. ${yearsText}`);
       }
 
-      await page.click(reportSearchResult.selector);
-      await page.waitForLoadState('networkidle');
-      await this.delay(1000);
-
-      // 8. Extract financial data from the report page
-      console.log('  → Extracting financial data tables...');
-      const financialData = await this.extractFinancialData(page);
-
-      if (!financialData) {
-        return null;
+      // If we get here, none of the results had data for the target year
+      if (lastError) {
+        console.log(`  ✗ No results had data for year ${targetYear}`);
       }
-
-      return {
-        companyName: originalName || companyInfo.companyName || financialData.companyName || search.value,
-        registrationNumber: companyInfo.registrationNumber || financialData.registrationNumber,
-        taxNumber: companyInfo.taxNumber || financialData.taxNumber,
-        headquarter: companyInfo.headquarter || financialData.headquarter,
-        year: targetYear,
-        previousYear: financialData.extractedPreviousYear || targetYear - 1,
-        targetYear: financialData.extractedTargetYear || targetYear,
-        currency: financialData.currency,
-        unit: financialData.unit,
-        filingDate: financialData.filingDate,
-        incomeStatement: financialData.incomeStatement,
-        balanceSheet: financialData.balanceSheet,
-        extractedAt: new Date().toISOString(),
-        sourceURL: page.url()
-      };
+      return null;
 
     } catch (error) {
       console.error('  ! Scraping error:', error instanceof Error ? error.message : error);
       return null;
     } finally {
-      await page.close();
+      // ALWAYS close the page after each scrape
+      try {
+        await page.close();
+      } catch {
+        // Ignore close errors
+      }
     }
   }
 
@@ -440,29 +624,55 @@ export class EBeszamoloScraper {
   }
 
   private async handleTermsPopup(page: Page): Promise<boolean> {
-    if (this.termsAccepted) {
-      return false;
-    }
-
     try {
+      // Wait briefly for popup to appear
+      await this.delay(500);
+
       // Check if terms popup is visible
-      const checkbox = await page.$('#acceptCheck', { strict: true });
+      const popup = await page.$('.modal-content, [role="dialog"]');
+      if (!popup) {
+        return false;
+      }
+
+      // Scroll down in the popup to make checkbox visible
+      console.log('  → Scrolling through terms and conditions...');
+      await page.evaluate(() => {
+        const modalBody = document.querySelector('.modal-body');
+        if (modalBody) {
+          modalBody.scrollTop = modalBody.scrollHeight;
+        }
+        // Also try scrolling any scrollable container
+        const scrollables = document.querySelectorAll('[style*="overflow"], .overflow-auto, .overflow-scroll');
+        scrollables.forEach(el => {
+          (el as HTMLElement).scrollTop = (el as HTMLElement).scrollHeight;
+        });
+      });
+      await this.delay(500);
+
+      // Find and click the checkbox
+      const checkbox = await page.$('#acceptCheck');
       if (checkbox) {
         console.log('  → Accepting terms and conditions...');
-        await checkbox.click();
-        await this.delay(300);
 
+        // Scroll checkbox into view and click
+        await checkbox.scrollIntoViewIfNeeded();
+        await this.delay(200);
+        await checkbox.click();
+        await this.delay(500);
+
+        // Click the submit button
         const submitButton = await page.$('button:has-text("Tovább")');
         if (submitButton) {
+          await submitButton.scrollIntoViewIfNeeded();
+          await this.delay(200);
           await submitButton.click();
-          await this.delay(1000);
+          await this.delay(1500);
         }
 
-        this.termsAccepted = true;
         return true; // Popup was handled
       }
-    } catch {
-      // Popup not present, continue
+    } catch (error) {
+      console.log('  → No terms popup or already accepted');
     }
     return false;
   }
@@ -657,6 +867,12 @@ export class EBeszamoloScraper {
 
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Randomized delay to avoid detection patterns
+  private randomDelay(minMs: number, maxMs: number): Promise<void> {
+    const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    return this.delay(ms);
   }
 
   // Export to JSON
