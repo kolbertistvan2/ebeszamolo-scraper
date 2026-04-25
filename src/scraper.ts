@@ -167,6 +167,7 @@ export class EBeszamoloScraper {
           console.log('  → Searching by company name...');
           await page.fill('input#firmName', search.value);
         }
+        await this.solveCaptchaIfPresent(page);
         await page.click('button#btnSubmit');
       };
 
@@ -418,6 +419,24 @@ export class EBeszamoloScraper {
     } finally {
       await page.close();
     }
+  }
+
+  private async solveCaptchaIfPresent(page: Page, timeoutMs = 30000): Promise<void> {
+    const widget = await page.$('altcha-widget');
+    if (!widget) return;
+
+    console.log('  → ALTCHA widget detected, triggering proof-of-work...');
+
+    await page.click('altcha-widget input[type="checkbox"]');
+
+    try {
+      await page.waitForSelector('altcha-widget .altcha[data-state="verified"]', { timeout: timeoutMs });
+      console.log('  → ✓ ALTCHA verified');
+    } catch {
+      console.log('  → ⚠ ALTCHA verification did not complete within timeout');
+    }
+
+    await this.delay(300);
   }
 
   private async handleTermsPopup(page: Page): Promise<boolean> {
